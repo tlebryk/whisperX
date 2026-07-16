@@ -3,8 +3,7 @@ Forced Alignment with Whisper
 C. Max Bain
 """
 from dataclasses import dataclass
-from contextlib import nullcontext
-from typing import Iterable, NamedTuple, Optional, Union, List
+from typing import Iterable, Optional, Union, List
 
 import numpy as np
 import torch
@@ -17,6 +16,7 @@ from whisperx.types import (
     SingleSegment,
     SingleAlignedSegment,
     SegmentData,
+    CharAlignmentArrays,
 )
 from nltk.tokenize.punkt import PunktSentenceTokenizer, PunktParameters
 
@@ -24,21 +24,6 @@ PUNKT_ABBREVIATIONS = ['dr', 'vs', 'mr', 'mrs', 'prof']
 
 LANGUAGES_WITHOUT_SPACES = ["ja", "zh"]
 
-
-class CharAlignmentArrays(NamedTuple):
-    """Columnar character alignment data indexed by transcript position."""
-
-    chars: list[str]
-    starts: np.ndarray
-    ends: np.ndarray
-    scores: np.ndarray
-    word_ids: np.ndarray
-
-
-def _nvtx_range(name: str):
-    if torch.cuda.is_available():
-        return torch.cuda.nvtx.range(name)
-    return nullcontext()
 
 DEFAULT_ALIGN_MODELS_TORCH = {
     "en": "WAV2VEC2_ASR_BASE_960H",
@@ -244,20 +229,19 @@ def _compute_emission_batch(
             # per item and batch the remaining convolution blocks.
             first_block_sequences = []
             first_block = model.feature_extractor.conv_layers[0]
-            with _nvtx_range("alignment.batch.first_conv_group_norm"):
-                for waveform_segment in flattened_waveforms:
-                    if waveform_segment.shape[-1] < 400:
-                        waveform_segment = torch.nn.functional.pad(
-                            waveform_segment,
-                            (0, 400 - waveform_segment.shape[-1]),
-                        )
-                    features, _ = first_block(
-                        waveform_segment.unsqueeze(0).unsqueeze(0).to(device),
-                        length=None,
+            for waveform_segment in flattened_waveforms:
+                if waveform_segment.shape[-1] < 400:
+                    waveform_segment = torch.nn.functional.pad(
+                        waveform_segment,
+                        (0, 400 - waveform_segment.shape[-1]),
                     )
-                    first_block_sequences.append(
-                        features.squeeze(0).transpose(0, 1)
-                    )
+                features, _ = first_block(
+                    waveform_segment.unsqueeze(0).unsqueeze(0).to(device),
+                    length=None,
+                )
+                first_block_sequences.append(
+                    features.squeeze(0).transpose(0, 1)
+                )
 
             # pad_sequence uses [time, channels], while the convolution blocks
             # consume [batch, channels, time].
@@ -271,19 +255,29 @@ def _compute_emission_batch(
                 batch_first=True,
             ).transpose(1, 2)
 
-            with _nvtx_range("alignment.batch.batched_backbone"):
-                for conv_layer in model.feature_extractor.conv_layers[1:]:
-                    features, output_lengths = conv_layer(features, output_lengths)
-                features = features.transpose(1, 2)
-                emissions = model.encoder(features, lengths=output_lengths)
-                if model.aux is not None:
-                    emissions = model.aux(emissions)
+            for conv_layer in model.feature_extractor.conv_layers[1:]:
+                features, output_lengths = conv_layer(features, output_lengths)
+            features = features.transpose(1, 2)
+            emissions = model.encoder(features, lengths=output_lengths)
+            if model.aux is not None:
+                emissions = model.aux(emissions)
         elif model_type == "huggingface":
-            if getattr(model.config, "feat_extract_norm", None) == "group":
-                raise NotImplementedError(
-                    "Batched Hugging Face alignment does not yet support "
-                    "GroupNorm feature extractors."
-                )
+            # Padding variable-length inputs before a GroupNorm feature
+            # extractor changes the normalization statistics for shorter
+            # items. Only use the padded batch path for the LayerNorm
+            # architecture we have validated. Preserve alignment support for
+            # GroupNorm and unknown/custom architectures by using the existing
+            # single-item forward path.
+            if getattr(model.config, "feat_extract_norm", None) != "layer":
+                return [
+                    _compute_emission(
+                        waveform_segment.unsqueeze(0),
+                        model,
+                        model_type,
+                        device,
+                    )
+                    for waveform_segment in flattened_waveforms
+                ]
             lengths = torch.as_tensor(
                 [waveform_segment.shape[-1] for waveform_segment in flattened_waveforms],
                 dtype=torch.long,
@@ -681,8 +675,7 @@ def align(
         f2 = int(t2 * SAMPLE_RATE)
 
         waveform_segment = audio[:, f1:f2]
-        with _nvtx_range("alignment.single.wav2vec"):
-            emission = _compute_emission(waveform_segment, model, model_type, device)
+        emission = _compute_emission(waveform_segment, model, model_type, device)
         aligned_subsegments = _finish_alignment_segment(
             segment,
             segment_data[sdx],
@@ -785,13 +778,12 @@ def align_batch(
 
     for batch_start in range(0, len(segment_jobs), batch_size):
         batch_jobs = segment_jobs[batch_start:batch_start + batch_size]
-        with _nvtx_range("alignment.batch.wav2vec"):
-            emissions = _compute_emission_batch(
-                [job["waveform_segment"] for job in batch_jobs],
-                model,
-                model_type,
-                device,
-            )
+        emissions = _compute_emission_batch(
+            [job["waveform_segment"] for job in batch_jobs],
+            model,
+            model_type,
+            device,
+        )
         if len(emissions) != len(batch_jobs):
             raise RuntimeError(
                 "Batch alignment model returned an unexpected number of emissions: "

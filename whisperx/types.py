@@ -1,4 +1,6 @@
-from typing import TypedDict, Optional, List, Tuple
+from typing import List, NamedTuple, Optional, Tuple, TypedDict
+
+import numpy as np
 
 
 class SingleWordSegment(TypedDict):
@@ -39,6 +41,16 @@ class SegmentData(TypedDict):
     clean_cdx: List[int]   # Original indices of cleaned characters
     clean_wdx: List[int]   # Indices of words containing valid characters
     sentence_spans: List[Tuple[int, int]]  # Start and end indices of sentences
+
+
+class CharAlignmentArrays(NamedTuple):
+    """Columnar character alignment data indexed by transcript position."""
+
+    chars: List[str]
+    starts: np.ndarray
+    ends: np.ndarray
+    scores: np.ndarray
+    word_ids: np.ndarray
 
 
 class SingleAlignedSegment(TypedDict):
