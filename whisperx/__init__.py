@@ -29,3 +29,7 @@ def load_audio(*args, **kwargs):
 def assign_word_speakers(*args, **kwargs):
     diarize = _lazy_import("diarize")
     return diarize.assign_word_speakers(*args, **kwargs)
+
+def align_batch(*args, **kwargs):
+    alignment = _lazy_import("alignment")
+    return alignment.align_batch(*args, **kwargs)
